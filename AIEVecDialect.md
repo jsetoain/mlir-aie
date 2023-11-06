@@ -82,6 +82,107 @@ Effects: MemoryEffects::Effect{}
 | `result` | vector of any type values
 
 
+### `aievec.band` (::xilinx::aievec::BandOp)
+
+_AIE vector bitwise and_
+
+
+Syntax:
+
+```
+operation ::= `aievec.band` $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `,` type($result)
+```
+
+AMD-specific intrinsic that computes bitwise and of two vectors and returns the result.
+`$result = band(`$lhs, $rhs`).
+
+Traits: AlwaysSpeculatableImplTrait
+
+Interfaces: ConditionallySpeculatable, NoMemoryEffect (MemoryEffectOpInterface)
+
+Effects: MemoryEffects::Effect{}
+
+#### Operands:
+
+| Operand | Description |
+| :-----: | ----------- |
+| `lhs` | vector of any type values
+| `rhs` | vector of any type values
+
+#### Results:
+
+| Result | Description |
+| :----: | ----------- |
+| `result` | vector of any type values
+
+
+### `aievec.bneg` (::xilinx::aievec::BnegOp)
+
+_AIE vector bitwise negation_
+
+
+Syntax:
+
+```
+operation ::= `aievec.bneg` $source attr-dict `:` type($result)
+```
+
+AMD-specific intrinsic that computes bitwise negation of a vector and returns the result.
+`$result = bneg(`$source`).
+
+Traits: AlwaysSpeculatableImplTrait
+
+Interfaces: ConditionallySpeculatable, NoMemoryEffect (MemoryEffectOpInterface)
+
+Effects: MemoryEffects::Effect{}
+
+#### Operands:
+
+| Operand | Description |
+| :-----: | ----------- |
+| `source` | vector of any type values
+
+#### Results:
+
+| Result | Description |
+| :----: | ----------- |
+| `result` | vector of any type values
+
+
+### `aievec.bor` (::xilinx::aievec::BorOp)
+
+_AIE vector bitwise or_
+
+
+Syntax:
+
+```
+operation ::= `aievec.bor` $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `,` type($result)
+```
+
+AMD-specific intrinsic that computes bitwise or of two vectors and returns the result.
+`$result = bor(`$lhs, $rhs`).
+
+Traits: AlwaysSpeculatableImplTrait
+
+Interfaces: ConditionallySpeculatable, NoMemoryEffect (MemoryEffectOpInterface)
+
+Effects: MemoryEffects::Effect{}
+
+#### Operands:
+
+| Operand | Description |
+| :-----: | ----------- |
+| `lhs` | vector of any type values
+| `rhs` | vector of any type values
+
+#### Results:
+
+| Result | Description |
+| :----: | ----------- |
+| `result` | vector of any type values
+
+
 ### `aievec.broadcast` (::xilinx::aievec::BroadcastOp)
 
 _AIE-ML broadcast_
@@ -134,6 +235,40 @@ Effects: MemoryEffects::Effect{}
 | Operand | Description |
 | :-----: | ----------- |
 | `source` | any type
+
+#### Results:
+
+| Result | Description |
+| :----: | ----------- |
+| `result` | vector of any type values
+
+
+### `aievec.bxor` (::xilinx::aievec::BxorOp)
+
+_AIE vector bitwise xor_
+
+
+Syntax:
+
+```
+operation ::= `aievec.bxor` $lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `,` type($result)
+```
+
+AMD-specific intrinsic that computes bitwise xor of two vectors and returns the result.
+`$result = bxor(`$lhs, $rhs`).
+
+Traits: AlwaysSpeculatableImplTrait
+
+Interfaces: ConditionallySpeculatable, NoMemoryEffect (MemoryEffectOpInterface)
+
+Effects: MemoryEffects::Effect{}
+
+#### Operands:
+
+| Operand | Description |
+| :-----: | ----------- |
+| `lhs` | vector of any type values
+| `rhs` | vector of any type values
 
 #### Results:
 
