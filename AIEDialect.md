@@ -267,7 +267,7 @@ aie.device(xcvc1902) {
 }
 ```
 
-Traits: HasParent<ModuleOp>, IsolatedFromAbove, NoTerminator, SingleBlock, SymbolTable
+Traits: HasParent<mlir::ModuleOp>, IsolatedFromAbove, NoTerminator, SingleBlock, SymbolTable
 
 Interfaces: AIETarget
 
@@ -402,9 +402,7 @@ Example:
     AIE.dmaBd(<$buf0 : memref<512xi32>, 0, 512>, 1)
     AIE.useLock(%lck, "Release", 1)
     br ^bd6 // point to the next Block, which is also a different Block Descriptor
-
 ```
-
 
 #### Attributes:
 
@@ -447,7 +445,7 @@ Conceptually, the AIE.dmaStart operation is a terminator that either passes
 control to a basic block containing DMA operations (through its first successor)
 or to a basic block for another dmaStart, to an AIE.end operation.
 
-Traits: HasParent<MemOp, MemTileDMAOp, func::FuncOp, ShimDMAOp>, Terminator
+Traits: HasParent<MemOp, MemTileDMAOp, mlir::func::FuncOp, ShimDMAOp>, Terminator
 
 #### Attributes:
 
@@ -896,7 +894,7 @@ Example:
   }
 ```
 
-Traits: HasParent<MemOp, MemTileDMAOp, func::FuncOp, ShimDMAOp>, Terminator
+Traits: HasParent<MemOp, MemTileDMAOp, mlir::func::FuncOp, ShimDMAOp>, Terminator
 
 #### Successors:
 
@@ -1164,7 +1162,12 @@ _Operation that produces the acquire/release patterns for a process registered t
 Syntax:
 
 ```
-operation ::= `AIE.objectFifo.registerProcess` attr-dict $objFifo_name `(` $port `,` $acquirePatternTensor `:` type($acquirePatternTensor) `,` $releasePatternTensor `:` type($releasePatternTensor) `,` $callee `,` $length`)`
+operation ::= `AIE.objectFifo.registerProcess` attr-dict $objFifo_name `(`
+              $port `,`
+              $acquirePatternTensor `:` type($acquirePatternTensor) `,`
+              $releasePatternTensor `:` type($releasePatternTensor) `,`
+              $callee `,` $length
+              `)`
 ```
 
 The `aie.registerProcess` operation allows the user to register a function to an `objectFifo` along with its
