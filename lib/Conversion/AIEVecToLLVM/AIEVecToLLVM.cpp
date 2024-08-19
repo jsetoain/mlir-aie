@@ -19,6 +19,8 @@
 #include "aie/Dialect/XLLVM/XLLVMDialect.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/TypeUtilities.h"
 #include <sstream>
@@ -71,9 +73,9 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
   if (valTy == type)
     return val;
   auto srcVecTy = dyn_cast<VectorType>(valTy);
-  if (srcVecTy) {
-    auto dstVecTy = dyn_cast<VectorType>(type);
-    assert(dstVecTy && "vector values cannot be forced into a non-vector type");
+  auto dstVecTy = dyn_cast<VectorType>(type);
+  if (srcVecTy && dstVecTy) {
+    // Vector to Vector
     assert(srcVecTy.getRank() == 1 && dstVecTy.getRank() == 1 &&
            "only flat 1D vectors can be force casted");
     int64_t dstVecLength =
@@ -82,7 +84,7 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
         srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
     if (srcVecLength != dstVecLength) {
       assert(srcVecLength < dstVecLength &&
-             "only widening forced casts are supported");
+             "narrowing vector forced casts are not supported");
       assert(dstVecLength == 512 &&
              (srcVecLength == 128 || srcVecLength == 256) &&
              "only 128b to 512b and 256b to 512b forced casts are supported");
@@ -91,6 +93,70 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
       else
         val = widen256bVectorValueTo512b(builder, loc, val);
     }
+  } else if (!srcVecTy && !dstVecTy) {
+    // Scalar to Scalar
+    int64_t dstBitWidth = type.getIntOrFloatBitWidth();
+    if (valTy.isIndex()) {
+      valTy = builder.getIntegerType(dstBitWidth);
+      val = builder.create<index::CastSOp>(loc, valTy, val);
+    }
+    int64_t srcBitWidth = valTy.getIntOrFloatBitWidth();
+    if (srcBitWidth > dstBitWidth) {
+      //    assert(srcBitWidth <= dstBitWidth &&
+      //           "narrowing scalar forced casts are not supported");
+      if (valTy.isInteger()) {
+        val = builder.create<LLVM::TruncOp>(loc, type, val);
+      } else {
+        val = builder.create<LLVM::FPTruncOp>(loc, type, val);
+      }
+    } else if (srcBitWidth < dstBitWidth) {
+      if (valTy.isInteger()) {
+        val = builder.create<LLVM::SExtOp>(
+            loc, builder.getIntegerType(dstBitWidth), val);
+      } else {
+        Type dstTy;
+        if (isa<FloatType>(type))
+          dstTy = type;
+        else
+          switch (dstBitWidth) {
+          case 8:
+            // Widen to F8E3M4
+            dstTy = builder.getFloat8E3M4Type();
+            break;
+          case 16:
+            // Widen to f16
+            dstTy = builder.getF16Type();
+            break;
+          case 32:
+            dstTy = builder.getF32Type();
+            break;
+          case 64:
+            dstTy = builder.getF64Type();
+            break;
+          case 80:
+            dstTy = builder.getF80Type();
+            break;
+          default:
+            static_assert(static_cast<bool>(
+                "unsupported widening of floating point value"));
+          }
+        val = builder.create<LLVM::FPExtOp>(loc, dstTy, val);
+      }
+    }
+  } else {
+    // Vector -> Scalar & Scalar -> Vector
+    unsigned int srcBitWidth;
+    unsigned int dstBitWidth;
+    if (srcVecTy) {
+      srcBitWidth = srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
+      dstBitWidth = type.getIntOrFloatBitWidth();
+    } else {
+      srcBitWidth = valTy.getIntOrFloatBitWidth();
+      dstBitWidth = dstVecTy.getElementTypeBitWidth() * dstVecTy.getShape()[0];
+    }
+    assert(srcBitWidth == dstBitWidth &&
+           "to force cast of vector to scalar and viceversa, both operands "
+           "must have the same bitwidth");
   }
   return bitcastValueToType(builder, loc, val, type);
 }
@@ -429,14 +495,16 @@ public:
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 16) {
+      }
+      if (lhsBitWidth == 16) {
         return {DecodedMulElemOp::Kind::I16_I16_I32_32x1x1x1,
                 aiev2_vmac_compute_control(
                     /*sgn_x=*/1, /*sgn_y=*/1, /*amode=*/0, /*bmode=*/3,
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 32) {
+      }
+      if (lhsBitWidth == 32) {
         // emulated I32 mul_elem
         return {DecodedMulElemOp::Kind::I32_I32_I64_32x1x2x1, -1};
       }
@@ -449,7 +517,8 @@ public:
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 32) {
+      }
+      if (lhsBitWidth == 32) {
         // emulated FP32 mul_elem
         return {DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1, -1};
       }
@@ -778,8 +847,9 @@ public:
     // Handle the emulated I32/FP32 mul_elem
     if (decodedMulElemOp.kind == DecodedMulElemOp::Kind::I32_I32_I64_32x1x2x1) {
       return convertToEmulatedI32MulElem(op, adaptor, rewriter);
-    } else if (decodedMulElemOp.kind ==
-               DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1) {
+    }
+    if (decodedMulElemOp.kind ==
+        DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1) {
       return convertToEmulatedFP32MulElem(op, adaptor, rewriter);
     }
 
@@ -2118,37 +2188,34 @@ class MatMulOpConversion
                       /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
                       /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                       /*sub_mask=*/0)};
-        } else {
-          // <4x8xi8> x <8x8xi8> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/1,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
         }
-      } else {
-        if (rhsBitWidth == 8) {
-          // <4x4xi16> x <4x8xi8> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/2,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
-        } else {
-          // <4x2xi16> x <2x8xi16> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/3,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
-        }
+        // <4x8xi8> x <8x8xi8> + <4x8xi32>
+        return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+                aiev2_vmac_compute_control(
+                    /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                    /*bmode=*/1,
+                    /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                    /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                    /*sub_mask=*/0)};
       }
+      if (rhsBitWidth == 8) {
+        // <4x4xi16> x <4x8xi8> + <4x8xi32>
+        return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+                aiev2_vmac_compute_control(
+                    /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                    /*bmode=*/2,
+                    /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                    /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                    /*sub_mask=*/0)};
+      }
+      // <4x2xi16> x <2x8xi16> + <4x8xi32>
+      return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+              aiev2_vmac_compute_control(
+                  /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                  /*bmode=*/3,
+                  /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                  /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                  /*sub_mask=*/0)};
     }
 
     if (lhsBitWidth == 16) {
@@ -2320,6 +2387,89 @@ class ShuffleOpConversion
   }
 };
 
+class InsertOpDirectConversion
+    : public mlir::ConvertOpToLLVMPattern<aievec::InsertOp> {
+  using ConvertOpToLLVMPattern<aievec::InsertOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::InsertOp insertOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = insertOp.getLoc();
+    auto srcTy = insertOp.getSourceType();
+    int64_t srcSz;
+    auto srcVecTy = dyn_cast<VectorType>(srcTy);
+    if (srcVecTy)
+      srcSz = srcVecTy.getElementType().getIntOrFloatBitWidth() *
+              srcVecTy.getShape()[0];
+    else
+      srcSz = srcTy.getIntOrFloatBitWidth();
+
+    auto dstVecTy = insertOp.getDestVectorType();
+    auto dstSz = dstVecTy.getElementType().getIntOrFloatBitWidth() *
+                 dstVecTy.getShape()[0];
+    // This pattern deals only with direct conversions
+    if (srcSz > 64 || dstSz != 512)
+      return failure();
+
+    auto srcVal = adaptor.getSource();
+    if (isa<FloatType>(srcTy)) {
+      srcTy = rewriter.getIntegerType(srcSz);
+      srcVal = rewriter.create<LLVM::BitcastOp>(loc, srcTy, srcVal);
+    }
+    auto i32ty = rewriter.getI32Type();
+    auto v16xi32ty = VectorType::get({16}, i32ty);
+    Value pos;
+    if (adaptor.getDynamicPosition().size() == 1)
+      pos = adaptor.getDynamicPosition()[0];
+    else
+      pos = rewriter.create<LLVM::ConstantOp>(
+          loc, i32ty, (int32_t)adaptor.getStaticPosition()[0]);
+    Value result;
+    if (srcSz == 8) {
+      // Cast i8-equivalent source value to i32ty
+      auto intrOp = rewriter.create<xllvm::VectorInsertI8I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+      result = forceCastValueToType(rewriter, loc, intrOp, dstVecTy);
+    }
+
+    if (srcSz == 16) {
+      // Cast i16-equivalent source value to i32ty
+      auto intrOp = rewriter.create<xllvm::VectorInsertI16I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+      result = forceCastValueToType(rewriter, loc, intrOp, dstVecTy);
+    }
+
+    if (srcSz == 32) {
+      auto intrOp = rewriter.create<xllvm::VectorInsertI32I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+      result = forceCastValueToType(rewriter, loc, intrOp, dstVecTy);
+    }
+
+    if (srcSz == 64) {
+      auto v2xi32ty = VectorType::get({2}, i32ty);
+      auto intrOp = rewriter.create<xllvm::VectorInsertI64I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, v2xi32ty}));
+      result = forceCastValueToType(rewriter, loc, intrOp, dstVecTy);
+    }
+
+    rewriter.replaceOp(insertOp, result);
+
+    return success();
+  }
+};
+
 void populateAIEVecToLLVMConversionPatterns(
     mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns,
     Aie2Fp32Emulation aie2Fp32EmulationOption) {
@@ -2345,7 +2495,8 @@ void populateAIEVecToLLVMConversionPatterns(
                ShiftOpConversion,
                ExtractElemOpConversion,
                FoldAIECastOps,
-               ShuffleOpConversion>(converter);
+               ShuffleOpConversion,
+               InsertOpDirectConversion>(converter);
   patterns.add<MulElemOpConversion>(converter, aie2Fp32EmulationOption);
   // clang-format on
 }
@@ -2367,7 +2518,8 @@ struct ConvertAIEVecToLLVMPass
     LLVMConversionTarget target(getContext());
     target.addIllegalDialect<xilinx::aievec::AIEVecDialect,
                              xilinx::aievec::aie1::AIEVecAIE1Dialect>();
-    target.addLegalDialect<arith::ArithDialect, vector::VectorDialect,
+    target.addLegalDialect<arith::ArithDialect, index::IndexDialect,
+                           LLVM::LLVMDialect, vector::VectorDialect,
                            xilinx::xllvm::XLLVMDialect>();
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
