@@ -19,6 +19,8 @@
 #include "aie/Dialect/XLLVM/XLLVMDialect.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
+#include "mlir/Dialect/Index/IR/IndexOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/TypeUtilities.h"
 #include <sstream>
@@ -71,9 +73,9 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
   if (valTy == type)
     return val;
   auto srcVecTy = dyn_cast<VectorType>(valTy);
-  if (srcVecTy) {
-    auto dstVecTy = dyn_cast<VectorType>(type);
-    assert(dstVecTy && "vector values cannot be forced into a non-vector type");
+  auto dstVecTy = dyn_cast<VectorType>(type);
+  if (srcVecTy && dstVecTy) {
+    // Vector to Vector
     assert(srcVecTy.getRank() == 1 && dstVecTy.getRank() == 1 &&
            "only flat 1D vectors can be force casted");
     int64_t dstVecLength =
@@ -82,7 +84,7 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
         srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
     if (srcVecLength != dstVecLength) {
       assert(srcVecLength < dstVecLength &&
-             "only widening forced casts are supported");
+             "narrowing vector forced casts are not supported");
       assert(dstVecLength == 512 &&
              (srcVecLength == 128 || srcVecLength == 256) &&
              "only 128b to 512b and 256b to 512b forced casts are supported");
@@ -91,6 +93,70 @@ static Value forceCastValueToType(OpBuilder &builder, Location loc, Value val,
       else
         val = widen256bVectorValueTo512b(builder, loc, val);
     }
+  } else if (!srcVecTy && !dstVecTy) {
+    // Scalar to Scalar
+    int64_t dstBitWidth = type.getIntOrFloatBitWidth();
+    if (valTy.isIndex()) {
+      valTy = builder.getIntegerType(dstBitWidth);
+      val = builder.create<index::CastSOp>(loc, valTy, val);
+    }
+    int64_t srcBitWidth = valTy.getIntOrFloatBitWidth();
+    if (srcBitWidth > dstBitWidth) {
+      //    assert(srcBitWidth <= dstBitWidth &&
+      //           "narrowing scalar forced casts are not supported");
+      if (valTy.isInteger()) {
+        val = builder.create<LLVM::TruncOp>(loc, type, val);
+      } else {
+        val = builder.create<LLVM::FPTruncOp>(loc, type, val);
+      }
+    } else if (srcBitWidth < dstBitWidth) {
+      if (valTy.isInteger()) {
+        val = builder.create<LLVM::SExtOp>(
+            loc, builder.getIntegerType(dstBitWidth), val);
+      } else {
+        Type dstTy;
+        if (isa<FloatType>(type))
+          dstTy = type;
+        else
+          switch (dstBitWidth) {
+          case 8:
+            // Widen to F8E3M4
+            dstTy = builder.getFloat8E3M4Type();
+            break;
+          case 16:
+            // Widen to f16
+            dstTy = builder.getF16Type();
+            break;
+          case 32:
+            dstTy = builder.getF32Type();
+            break;
+          case 64:
+            dstTy = builder.getF64Type();
+            break;
+          case 80:
+            dstTy = builder.getF80Type();
+            break;
+          default:
+            static_assert(static_cast<bool>(
+                "unsupported widening of floating point value"));
+          }
+        val = builder.create<LLVM::FPExtOp>(loc, dstTy, val);
+      }
+    }
+  } else {
+    // Vector -> Scalar & Scalar -> Vector
+    unsigned int srcBitWidth;
+    unsigned int dstBitWidth;
+    if (srcVecTy) {
+      srcBitWidth = srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
+      dstBitWidth = type.getIntOrFloatBitWidth();
+    } else {
+      srcBitWidth = valTy.getIntOrFloatBitWidth();
+      dstBitWidth = dstVecTy.getElementTypeBitWidth() * dstVecTy.getShape()[0];
+    }
+    assert(srcBitWidth == dstBitWidth &&
+           "to force cast of vector to scalar and viceversa, both operands "
+           "must have the same bitwidth");
   }
   return bitcastValueToType(builder, loc, val, type);
 }
@@ -429,14 +495,16 @@ public:
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 16) {
+      }
+      if (lhsBitWidth == 16) {
         return {DecodedMulElemOp::Kind::I16_I16_I32_32x1x1x1,
                 aiev2_vmac_compute_control(
                     /*sgn_x=*/1, /*sgn_y=*/1, /*amode=*/0, /*bmode=*/3,
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 32) {
+      }
+      if (lhsBitWidth == 32) {
         // emulated I32 mul_elem
         return {DecodedMulElemOp::Kind::I32_I32_I64_32x1x2x1, -1};
       }
@@ -449,7 +517,8 @@ public:
                     /*variant=*/1, /*zero_acc=*/0, /*shift16=*/0,
                     /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                     /*sub_mask=*/0)};
-      } else if (lhsBitWidth == 32) {
+      }
+      if (lhsBitWidth == 32) {
         // emulated FP32 mul_elem
         return {DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1, -1};
       }
@@ -778,8 +847,9 @@ public:
     // Handle the emulated I32/FP32 mul_elem
     if (decodedMulElemOp.kind == DecodedMulElemOp::Kind::I32_I32_I64_32x1x2x1) {
       return convertToEmulatedI32MulElem(op, adaptor, rewriter);
-    } else if (decodedMulElemOp.kind ==
-               DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1) {
+    }
+    if (decodedMulElemOp.kind ==
+        DecodedMulElemOp::Kind::FP32_FP32_FP32_16x1x1x1) {
       return convertToEmulatedFP32MulElem(op, adaptor, rewriter);
     }
 
@@ -2044,7 +2114,7 @@ class MatMulOpConversion
   using ConvertOpToLLVMPattern<aievec::MatMulOp>::ConvertOpToLLVMPattern;
 
   struct DecodedMatMulOp {
-    typedef enum { I32, I64, BF16 } Kind;
+    using Kind = enum { I32, I64, BF16 };
 
     Kind kind;
     Value lhs;
@@ -2118,37 +2188,34 @@ class MatMulOpConversion
                       /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
                       /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
                       /*sub_mask=*/0)};
-        } else {
-          // <4x8xi8> x <8x8xi8> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/1,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
         }
-      } else {
-        if (rhsBitWidth == 8) {
-          // <4x4xi16> x <4x8xi8> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/2,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
-        } else {
-          // <4x2xi16> x <2x8xi16> + <4x8xi32>
-          return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
-                  aiev2_vmac_compute_control(
-                      /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
-                      /*bmode=*/3,
-                      /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
-                      /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
-                      /*sub_mask=*/0)};
-        }
+        // <4x8xi8> x <8x8xi8> + <4x8xi32>
+        return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+                aiev2_vmac_compute_control(
+                    /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                    /*bmode=*/1,
+                    /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                    /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                    /*sub_mask=*/0)};
       }
+      if (rhsBitWidth == 8) {
+        // <4x4xi16> x <4x8xi8> + <4x8xi32>
+        return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+                aiev2_vmac_compute_control(
+                    /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                    /*bmode=*/2,
+                    /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                    /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                    /*sub_mask=*/0)};
+      }
+      // <4x2xi16> x <2x8xi16> + <4x8xi32>
+      return {DecodedMatMulOp::Kind::I32, lhs, rhs, acc,
+              aiev2_vmac_compute_control(
+                  /*sgn_x=*/signX, /*sgn_y=*/signY, /*amode=*/0,
+                  /*bmode=*/3,
+                  /*variant=*/0, /*zero_acc=*/0, /*shift16=*/0,
+                  /*sub_mul=*/0, /*sub_acc1=*/0, /*sub_acc2=*/0,
+                  /*sub_mask=*/0)};
     }
 
     if (lhsBitWidth == 16) {
@@ -2320,6 +2387,393 @@ class ShuffleOpConversion
   }
 };
 
+class InsertOp128bInto512bConversion
+    : public mlir::ConvertOpToLLVMPattern<aievec::InsertOp> {
+  using ConvertOpToLLVMPattern<aievec::InsertOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::InsertOp insertOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = insertOp.getLoc();
+    auto srcTy = insertOp.getSourceType();
+    int64_t srcSz;
+    auto srcVecTy = dyn_cast<VectorType>(srcTy);
+    if (srcVecTy)
+      srcSz = srcVecTy.getElementType().getIntOrFloatBitWidth() *
+              srcVecTy.getShape()[0];
+    else
+      srcSz = srcTy.getIntOrFloatBitWidth();
+
+    auto dstVecTy = insertOp.getDestVectorType();
+    auto dstSz = dstVecTy.getElementType().getIntOrFloatBitWidth() *
+                 dstVecTy.getShape()[0];
+    if (srcSz != 128 || dstSz != 512) {
+      return rewriter.notifyMatchFailure(
+          insertOp, "not a 128-bit insertion into a 512-bit vector");
+    }
+
+    auto i32ty = rewriter.getI32Type();
+    IndexType idxTy = rewriter.getIndexType();
+    Value idxVal;
+    if (adaptor.getDynamicPosition().size() == 1)
+      idxVal = adaptor.getDynamicPosition()[0];
+    else
+      idxVal = rewriter.create<arith::ConstantOp>(
+          loc, idxTy, rewriter.getIndexAttr(adaptor.getStaticPosition()[0]));
+    auto pos = forceCastValueToType(rewriter, loc, idxVal, i32ty);
+
+    auto v4xi32ty = VectorType::get({4}, i32ty);
+    auto v16xi32ty = VectorType::get({16}, i32ty);
+    Value zvec = rewriter.create<arith::ConstantOp>(
+        loc, v16xi32ty, rewriter.getZeroAttr(v16xi32ty));
+    Value step = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)0);
+    Value c16i32 = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)16);
+    Value c32i32 = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)32);
+    Value c48i32 = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)48);
+    Value basevec =
+        forceCastValueToType(rewriter, loc, adaptor.getDest(), v16xi32ty);
+    Value insvec =
+        forceCastValueToType(rewriter, loc, adaptor.getSource(), v4xi32ty);
+    Value c0 = rewriter.create<arith::ConstantOp>(loc, idxTy,
+                                                  rewriter.getIndexAttr(0L));
+    Value c1 = rewriter.create<arith::ConstantOp>(loc, idxTy,
+                                                  rewriter.getIndexAttr(1L));
+    Value c2 = rewriter.create<arith::ConstantOp>(loc, idxTy,
+                                                  rewriter.getIndexAttr(2L));
+    Value c3 = rewriter.create<arith::ConstantOp>(loc, idxTy,
+                                                  rewriter.getIndexAttr(3L));
+
+    Value eq0cond = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, idxVal, c0);
+    Value eq1cond = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, idxVal, c1);
+    Value eq2cond = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, idxVal, c2);
+    Value eq3cond = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::eq, idxVal, c3);
+
+    Value newV0 =
+        rewriter
+            .create<scf::IfOp>(
+                loc, eq3cond,
+                [&](OpBuilder &b, Location loc) -> void {
+                  // Insert into the bottom half of the vector
+                  Value newVec = b.create<xllvm::VectorSetI512I128IntrOp>(
+                      loc, v16xi32ty, insvec);
+                  b.create<scf::YieldOp>(loc, SmallVector<Value, 1>({newVec}));
+                },
+                [&](OpBuilder &b, Location loc) -> void {
+                  Value s3 = rewriter.create<xllvm::VectorShiftI512I512IntrOp>(
+                      loc, v16xi32ty, basevec, zvec, step, c48i32);
+                  Value v3 = rewriter.create<xllvm::ExtI128I512IntrOp>(
+                      loc, v4xi32ty, s3);
+                  b.create<scf::YieldOp>(loc, SmallVector<Value, 1>({v3}));
+                })
+            .getResults()[0];
+    // XXX this doesn't work!!!
+    Value newV1 =
+        rewriter
+            .create<scf::IfOp>(
+                loc, eq2cond, [&](OpBuilder &b, Location loc) -> void {},
+                [&](OpBuilder &b, Location loc) -> void {
+                  Value s2 = rewriter.create<xllvm::VectorShiftI512I512IntrOp>(
+                      loc, v16xi32ty, basevec, zvec, step, c32i32);
+                  Value v2 = rewriter.create<xllvm::ExtI128I512IntrOp>(
+                      loc, v4xi32ty, s2);
+                  b.create<scf::YieldOp>(loc, SmallVector<Value, 1>({v2}));
+                })
+            .getResults()[0];
+
+    Value s1 = rewriter.create<xllvm::VectorShiftI512I512IntrOp>(
+        loc, v16xi32ty, basevec, zvec, step, c16i32);
+    Value v1 = rewriter.create<xllvm::ExtI128I512IntrOp>(loc, v4xi32ty, s1);
+
+    Value v0 =
+        rewriter.create<xllvm::ExtI128I512IntrOp>(loc, v4xi32ty, basevec);
+
+    //    Value newVec = rewriter.create<scf::IndexSwitchOp>(idxVal, [&]());
+    return failure();
+  }
+};
+
+class InsertOp256bConversion
+    : public mlir::ConvertOpToLLVMPattern<aievec::InsertOp> {
+  using ConvertOpToLLVMPattern<aievec::InsertOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::InsertOp insertOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = insertOp.getLoc();
+
+    auto dstVecTy = cast<VectorType>(adaptor.getDest().getType());
+    auto dstSz = dstVecTy.getElementType().getIntOrFloatBitWidth() *
+                 dstVecTy.getShape()[0];
+    if (dstSz != 256) {
+      return rewriter.notifyMatchFailure(
+          insertOp, "not an insertion into a 256-bit vector");
+    }
+
+    auto srcTy = adaptor.getSource().getType();
+    int64_t srcSz;
+    auto srcVecTy = dyn_cast<VectorType>(srcTy);
+    if (srcVecTy)
+      srcSz = srcVecTy.getElementType().getIntOrFloatBitWidth() *
+              srcVecTy.getShape()[0];
+    else
+      srcSz = srcTy.getIntOrFloatBitWidth();
+
+    if (srcSz != 8 && srcSz != 16 && srcSz != 32 && srcSz != 64 && srcSz != 128)
+      return rewriter.notifyMatchFailure(
+          insertOp, "source operand is not 8, 16, 32, 64, or 128 bit wide");
+
+    auto i32ty = rewriter.getI32Type();
+    auto v8xi32ty = VectorType::get({8}, i32ty);
+    auto v16xi32ty = VectorType::get({16}, i32ty);
+    VectorType dst2xVty = VectorType::get({dstVecTy.getShape()[0] * 2},
+                                          dstVecTy.getElementType());
+    Value dstVal =
+        forceCastValueToType(rewriter, loc, adaptor.getDest(), v8xi32ty);
+    Value zvec = rewriter.create<arith::ConstantOp>(
+        loc, v8xi32ty, rewriter.getZeroAttr(v8xi32ty));
+    Value dst512bVal = rewriter.create<xllvm::ConcatI512I256IntrOp>(
+        loc, v16xi32ty, dstVal, zvec);
+    Value dst2xVal = forceCastValueToType(rewriter, loc, dst512bVal, dst2xVty);
+    Value insertVal = rewriter.create<aievec::InsertOp>(
+        loc, dst2xVty, adaptor.getSource(), dst2xVal,
+        adaptor.getDynamicPosition(), adaptor.getStaticPosition());
+    insertVal = forceCastValueToType(rewriter, loc, insertVal, v16xi32ty);
+    auto cst0 = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)0);
+    Value newVec = rewriter.create<xllvm::ExtI256I512IntrOp>(loc, v8xi32ty,
+                                                             insertVal, cst0);
+    Value newOp = forceCastValueToType(rewriter, loc, newVec, dstVecTy);
+    rewriter.replaceOp(insertOp, newOp);
+
+    return success();
+  }
+};
+
+class InsertOp1024bConversion
+    : public mlir::ConvertOpToLLVMPattern<aievec::InsertOp> {
+  using ConvertOpToLLVMPattern<aievec::InsertOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::InsertOp insertOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    VectorType dstVecTy = cast<VectorType>(adaptor.getDest().getType());
+    int64_t dstNumEl = dstVecTy.getShape()[0];
+    uint32_t dstElSz = dstVecTy.getElementType().getIntOrFloatBitWidth();
+    int64_t dstSz = dstNumEl * dstElSz;
+    if (dstSz != 1024) {
+      return rewriter.notifyMatchFailure(
+          insertOp, "not an insertion into a 1024-bit vector");
+    }
+
+    Type srcTy = adaptor.getSource().getType();
+    int64_t srcSz;
+    VectorType srcVecTy = dyn_cast<VectorType>(srcTy);
+    if (srcVecTy)
+      srcSz = srcVecTy.getElementType().getIntOrFloatBitWidth() *
+              srcVecTy.getShape()[0];
+    else
+      srcSz = srcTy.getIntOrFloatBitWidth();
+
+    if (srcSz != 8 && srcSz != 16 && srcSz != 32 && srcSz != 64 && srcSz != 128)
+      return rewriter.notifyMatchFailure(
+          insertOp, "source operand is not 8, 16, 32, 64, or 128 bit wide");
+
+    auto loc = insertOp.getLoc();
+    Type i32ty = rewriter.getI32Type();
+    IndexType idxTy = rewriter.getIndexType();
+    int64_t numElHalfVec = dstNumEl / 2;
+    Value cstNumElHalfVec = rewriter.create<arith::ConstantOp>(
+        loc, idxTy, rewriter.getIndexAttr(numElHalfVec));
+    Value idxVal;
+    if (adaptor.getDynamicPosition().size() == 1)
+      idxVal = adaptor.getDynamicPosition()[0];
+    else
+      idxVal = rewriter.create<arith::ConstantOp>(
+          loc, idxTy, rewriter.getIndexAttr(adaptor.getStaticPosition()[0]));
+    Type halfVecTy = VectorType::get({numElHalfVec}, dstVecTy.getElementType());
+    VectorType v32int32ty = VectorType::get({32}, i32ty);
+    VectorType v16int32ty = VectorType::get({16}, i32ty);
+
+    Value dstVecCast =
+        forceCastValueToType(rewriter, loc, adaptor.getDest(), v32int32ty);
+
+    // Extract bottom half
+    Value cstZeroI32 =
+        rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)0);
+    Value bVecExt = rewriter.create<xllvm::ExtI512I1024IntrOp>(
+        loc, v16int32ty, dstVecCast, cstZeroI32);
+    Value bVec = forceCastValueToType(rewriter, loc, bVecExt, halfVecTy);
+
+    // Extract top half
+    Value cstOneI32 = rewriter.create<LLVM::ConstantOp>(loc, i32ty, (int32_t)1);
+    Value tVecExt = rewriter.create<xllvm::ExtI512I1024IntrOp>(
+        loc, v16int32ty, dstVecCast, cstOneI32);
+    Value tVec = forceCastValueToType(rewriter, loc, tVecExt, halfVecTy);
+
+    // Find out which half we need to insert into
+    Value idxLtHalfCond = rewriter.create<arith::CmpIOp>(
+        loc, arith::CmpIPredicate::slt, idxVal, cstNumElHalfVec);
+    rewriter.replaceOpWithNewOp<scf::IfOp>(
+        insertOp, idxLtHalfCond,
+        [&](OpBuilder &b, Location loc) -> void {
+          // Insert into the bottom half of the vector
+          Value newBVec = b.create<aievec::InsertOp>(loc, adaptor.getSource(),
+                                                     bVec, idxVal);
+          Value newBVecCast = forceCastValueToType(b, loc, newBVec, v16int32ty);
+          Value resVecCast = b.create<xllvm::ConcatI1024I512IntrOp>(
+              loc, v32int32ty, newBVecCast, tVecExt);
+          Value resVec = forceCastValueToType(b, loc, resVecCast, dstVecTy);
+          b.create<scf::YieldOp>(loc, SmallVector<Value, 1>({resVec}));
+        },
+        [&](OpBuilder &b, Location loc) -> void {
+          // Insert into the top half of the vector
+          Value newIdxVal =
+              b.create<arith::SubIOp>(loc, idxTy, idxVal, cstNumElHalfVec);
+          Value newTVec = b.create<aievec::InsertOp>(loc, adaptor.getSource(),
+                                                     tVec, newIdxVal);
+          Value newTVecCast = forceCastValueToType(b, loc, newTVec, v16int32ty);
+          Value resVecCast = b.create<xllvm::ConcatI1024I512IntrOp>(
+              loc, v32int32ty, bVecExt, newTVecCast);
+          Value resVec = forceCastValueToType(b, loc, resVecCast, dstVecTy);
+          b.create<scf::YieldOp>(loc, SmallVector<Value, 1>({resVec}));
+        });
+    return success();
+  }
+};
+
+class InsertOpDirectConversion
+    : public mlir::ConvertOpToLLVMPattern<aievec::InsertOp> {
+  using ConvertOpToLLVMPattern<aievec::InsertOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(aievec::InsertOp insertOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = insertOp.getLoc();
+    auto srcTy = adaptor.getSource().getType();
+    int64_t srcSz;
+    auto srcVecTy = dyn_cast<VectorType>(srcTy);
+    if (srcVecTy)
+      srcSz = srcVecTy.getElementType().getIntOrFloatBitWidth() *
+              srcVecTy.getShape()[0];
+    else
+      srcSz = srcTy.getIntOrFloatBitWidth();
+
+    auto dstVecTy = cast<VectorType>(adaptor.getDest().getType());
+    auto dstSz = dstVecTy.getElementType().getIntOrFloatBitWidth() *
+                 dstVecTy.getShape()[0];
+
+    bool isDirectInsertion = false;
+    switch (srcSz) {
+    case 8:
+    case 16:
+    case 32:
+    case 64:
+      isDirectInsertion = dstSz == 512;
+      break;
+    case 256:
+      isDirectInsertion = dstSz == 512 || dstSz == 1024;
+      break;
+    case 512:
+      isDirectInsertion = dstSz == 1024;
+      break;
+    }
+    if (!isDirectInsertion)
+      return rewriter.notifyMatchFailure(insertOp, "not a direct insertion");
+
+    auto srcVal = adaptor.getSource();
+    if (isa<FloatType>(srcTy)) {
+      srcTy = rewriter.getIntegerType(srcSz);
+      srcVal = rewriter.create<LLVM::BitcastOp>(loc, srcTy, srcVal);
+    }
+    auto i32ty = rewriter.getI32Type();
+    auto v16xi32ty = VectorType::get({16}, i32ty);
+    Value pos;
+    if (adaptor.getDynamicPosition().size() == 1)
+      pos = adaptor.getDynamicPosition()[0];
+    else
+      pos = rewriter.create<LLVM::ConstantOp>(
+          loc, i32ty, (int32_t)adaptor.getStaticPosition()[0]);
+    Value intrOp;
+    if (srcSz == 8) {
+      // Cast i8-equivalent source value to i32ty
+      auto intrOp = rewriter.create<xllvm::VectorInsertI8I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+    }
+
+    if (srcSz == 16) {
+      // Cast i16-equivalent source value to i32ty
+      auto intrOp = rewriter.create<xllvm::VectorInsertI16I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+    }
+
+    if (srcSz == 32) {
+      auto intrOp = rewriter.create<xllvm::VectorInsertI32I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, i32ty}));
+    }
+
+    if (srcSz == 64) {
+      auto v2xi32ty = VectorType::get({2}, i32ty);
+      auto intrOp = rewriter.create<xllvm::VectorInsertI64I512IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), pos, srcVal},
+                                       {v16xi32ty, i32ty, v2xi32ty}));
+    }
+
+    if (srcSz == 128) {
+      // XXX: Not a direct case
+      // def VectorSetI512I128IntrOp :
+      //     AIEVec2_IntrOp<"set.I512.I128",
+      //         [TypeIs<"res", VectorOfLengthAndType<[16], [I32]>>]>,
+      //     Arguments<(ins VectorOfLengthAndType<[4], [I32]>:$src)>;
+      return rewriter.notifyMatchFailure(insertOp, "unimplemented insertion");
+    }
+
+    auto v8xi32ty = VectorType::get({8}, i32ty);
+    if (srcSz == 256 && dstSz == 512) {
+      auto intrOp = rewriter.create<xllvm::UpdI512I256IntrOp>(
+          loc, v16xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), srcVal, pos},
+                                       {v16xi32ty, v8xi32ty, i32ty}));
+    }
+
+    auto v32xi32ty = VectorType::get({32}, i32ty);
+    if (srcSz == 256 && dstSz == 1024) {
+      auto intrOp = rewriter.create<xllvm::UpdI1024I256IntrOp>(
+          loc, v32xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), srcVal, pos},
+                                       {v32xi32ty, v8xi32ty, i32ty}));
+    }
+
+    if (srcSz == 512 && dstSz == 1024) {
+      auto intrOp = rewriter.create<xllvm::UpdI1024I512IntrOp>(
+          loc, v32xi32ty,
+          forceCastOperandsToSignature(rewriter, loc,
+                                       {adaptor.getDest(), srcVal, pos},
+                                       {v32xi32ty, v16xi32ty, i32ty}));
+    }
+
+    Value result = forceCastValueToType(rewriter, loc, intrOp, dstVecTy);
+    rewriter.replaceOp(insertOp, result);
+
+    return success();
+  }
+};
+
 void populateAIEVecToLLVMConversionPatterns(
     mlir::LLVMTypeConverter &converter, mlir::RewritePatternSet &patterns,
     Aie2Fp32Emulation aie2Fp32EmulationOption) {
@@ -2345,7 +2799,11 @@ void populateAIEVecToLLVMConversionPatterns(
                ShiftOpConversion,
                ExtractElemOpConversion,
                FoldAIECastOps,
-               ShuffleOpConversion>(converter);
+               ShuffleOpConversion,
+               InsertOpDirectConversion,
+               InsertOp128bInto512bConversion,
+               InsertOp256bConversion,
+               InsertOp1024bConversion>(converter);
   patterns.add<MulElemOpConversion>(converter, aie2Fp32EmulationOption);
   // clang-format on
 }
@@ -2360,6 +2818,8 @@ struct ConvertAIEVecToLLVMPass
     // vector on our own.
     converter.addConversion(
         [&](VectorType type) -> std::optional<Type> { return type; });
+    converter.addConversion(
+        [&](IndexType type) -> std::optional<Type> { return type; });
 
     populateAIEVecToLLVMConversionPatterns(converter, patterns,
                                            aie2Fp32Emulation);
@@ -2367,8 +2827,9 @@ struct ConvertAIEVecToLLVMPass
     LLVMConversionTarget target(getContext());
     target.addIllegalDialect<xilinx::aievec::AIEVecDialect,
                              xilinx::aievec::aie1::AIEVecAIE1Dialect>();
-    target.addLegalDialect<arith::ArithDialect, vector::VectorDialect,
-                           xilinx::xllvm::XLLVMDialect>();
+    target.addLegalDialect<
+        arith::ArithDialect, index::IndexDialect, LLVM::LLVMDialect,
+        scf::SCFDialect, vector::VectorDialect, xilinx::xllvm::XLLVMDialect>();
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
       signalPassFailure();

@@ -34,6 +34,8 @@ def ConvertAIEVecToLLVM : Pass<"convert-aievec-to-llvm", "mlir::ModuleOp"> {
   let constructor = "xilinx::aievec::createConvertAIEVecToLLVMPass()";
   let dependentDialects = ["LLVM::LLVMDialect",
                            "mlir::arith::ArithDialect",
+                           "mlir::index::IndexDialect",
+                           "mlir::scf::SCFDialect",
                            "mlir::vector::VectorDialect",
                            "xilinx::xllvm::XLLVMDialect"];
   let options = [

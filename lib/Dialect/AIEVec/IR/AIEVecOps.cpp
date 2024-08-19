@@ -10,12 +10,12 @@
 // This file implements AIE vector op printing, pasing, and verification.
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/Transforms/FoldUtils.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <cstdint>
 
 #include "aie/Dialect/AIEVec/AIEVecUtils.h"
 #include "aie/Dialect/AIEVec/IR/AIEVecOps.h"
@@ -231,7 +231,7 @@ OpFoldResult CastOp::fold(FoldAdaptor adaptor) {
 
 // SRS fold method. It will fold with a preceding UPS operation.
 OpFoldResult SRSOp::fold(FoldAdaptor adaptor) {
-  auto srcDefOp = getSource().getDefiningOp();
+  auto *srcDefOp = getSource().getDefiningOp();
   if (!srcDefOp)
     return nullptr;
 
@@ -239,7 +239,7 @@ OpFoldResult SRSOp::fold(FoldAdaptor adaptor) {
   if (!upsOp)
     return nullptr;
 
-  auto shiftDefOp = getShift().getDefiningOp();
+  auto *shiftDefOp = getShift().getDefiningOp();
   if (!shiftDefOp)
     return nullptr;
 
@@ -292,8 +292,7 @@ LogicalResult SRSOp::verify() {
   if (isa<IntegerType>(atype) && stypeWidth >= atypeWidth)
     return emitError("the element type of source accumulator must be "
                      "wider than that of the result vector");
-  else if (isa<FloatType>(atype) && stypeWidth != 16 &&
-           stypeWidth != atypeWidth)
+  if (isa<FloatType>(atype) && stypeWidth != 16 && stypeWidth != atypeWidth)
     return emitError("the element type of source accumulator must be "
                      "same as the result vector");
 
@@ -350,7 +349,7 @@ OpFoldResult UPSOp::fold(FoldAdaptor adaptor) {
   // TODO: ignored here. Somebody should take a careful look at it.
   // TODO: In next llvm version: auto srsDefOp =
   // adaptor.getSource().getDefiningOp();
-  auto srcDefOp = getSource().getDefiningOp();
+  auto *srcDefOp = getSource().getDefiningOp();
   if (!srcDefOp)
     return nullptr;
   auto srsOp = llvm::dyn_cast<SRSOp>(srcDefOp);
@@ -1559,6 +1558,131 @@ ParseResult MulConvOp::parse(OpAsmParser &parser, OperationState &result) {
 
 ParseResult FMAConvOp::parse(OpAsmParser &parser, OperationState &result) {
   return parseMulFMAConvOp(parser, result, true);
+}
+
+int64_t aievec::ExtractOp::getPosition() {
+  if (getDynamicPosition().size() == 0)
+    return getStaticPosition()[0];
+
+  auto dynPos = getDynamicPosition()[0];
+  auto posDefOp = dynPos.getDefiningOp<arith::ConstantOp>();
+  if (posDefOp)
+    return cast<IntegerAttr>(posDefOp.getValue()).getValue().getSExtValue();
+  return ShapedType::kDynamic;
+}
+
+LogicalResult aievec::ExtractOp::verify() {
+  auto srcVecTy = this->getSourceVectorType();
+  if (srcVecTy.getShape().size() != 1)
+    return emitOpError("failed to verify that source is a 1D vector");
+
+  if (getNumIndices() != 1)
+    return emitOpError("expected a single extraction index");
+
+  auto resTy = this->getResult().getType();
+  auto resVecTy = dyn_cast<VectorType>(resTy);
+  int64_t resSize;
+  if (resVecTy) {
+    if (resVecTy.getShape().size() != 1)
+      return emitOpError("failed to verify that the result vector is 1D");
+    resSize = srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
+  } else {
+    resSize = resTy.getIntOrFloatBitWidth();
+  }
+
+  if (resSize != 8 && resSize != 16 && resSize != 32 && resSize != 64 &&
+      resSize != 128 && resSize != 256)
+    return emitOpError("failed to verify that the result is 8, 16, 32, 64, "
+                       "128, or 256 bits wide");
+
+  // Verify that the result can be extracted from the source at the specified
+  // position.
+  // If we don't know the extraction point, we assume it's valid.
+  int64_t srcSize = srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
+  int64_t pos = getPosition();
+  if (pos == ShapedType::kDynamic)
+    return success();
+
+  int64_t posInBits = pos * srcVecTy.getElementTypeBitWidth();
+  if (posInBits % srcSize)
+    return emitOpError(
+        "failed to verify that extraction index is aligned to source size");
+  if (posInBits + srcSize > resSize)
+    return emitOpError(
+               "failed to verify that the result fits in source from index ")
+           << pos;
+
+  return success();
+}
+
+int64_t aievec::InsertOp::getPosition() {
+  if (getDynamicPosition().size() == 0)
+    return getStaticPosition()[0];
+
+  auto dynPos = getDynamicPosition()[0];
+  auto posDefOp = dynPos.getDefiningOp<arith::ConstantOp>();
+  if (posDefOp)
+    return cast<IntegerAttr>(posDefOp.getValue()).getValue().getSExtValue();
+  return ShapedType::kDynamic;
+}
+
+LogicalResult aievec::InsertOp::verify() {
+  auto dstVecTy = this->getDestVectorType();
+  if (dstVecTy.getShape().size() != 1)
+    return emitOpError("failed to verify that the destination is a 1D vector");
+
+  if (getNumIndices() != 1)
+    return emitOpError("expected a single insertion index");
+
+  auto srcTy = this->getSourceType();
+  auto srcVecTy = dyn_cast<VectorType>(srcTy);
+  int64_t srcSize;
+  if (srcVecTy) {
+    if (srcVecTy.getShape().size() != 1)
+      return emitOpError("failed to verify that the source vector is 1D");
+    srcSize = srcVecTy.getElementTypeBitWidth() * srcVecTy.getShape()[0];
+  } else {
+    srcSize = srcTy.getIntOrFloatBitWidth();
+  }
+
+  if (srcSize != 8 && srcSize != 16 && srcSize != 32 && srcSize != 64 &&
+      srcSize != 128 && srcSize != 256)
+    return emitOpError("failed to verify that the source is 8, 16, 32, 64, "
+                       "128, or 256 bits wide");
+
+  // Verify that the source can be inserted in the destination at the specified
+  // position.
+  // If we don't know the insertion point, we assume it's valid.
+  int64_t dstSize = dstVecTy.getElementTypeBitWidth() * dstVecTy.getShape()[0];
+  int64_t pos = getPosition();
+  if (pos == ShapedType::kDynamic)
+    return success();
+
+  int64_t posInBits = pos * dstVecTy.getElementTypeBitWidth();
+  if (posInBits % srcSize)
+    return emitOpError(
+        "failed to verify that insertion index is aligned to source size");
+  if (posInBits + srcSize > dstSize)
+    return emitOpError(
+               "failed to verify that source fits in destination at index ")
+           << pos;
+  return success();
+}
+
+void aievec::InsertOp::build(::mlir::OpBuilder &builder,
+                             ::mlir::OperationState &state, mlir::Value source,
+                             mlir::Value dest, int64_t position) {
+  OpFoldResult posVal = builder.getI64IntegerAttr(position);
+  build(builder, state, source, dest, posVal);
+}
+
+void aievec::InsertOp::build(::mlir::OpBuilder &builder,
+                             ::mlir::OperationState &state, mlir::Value source,
+                             mlir::Value dest, mlir::OpFoldResult position) {
+  SmallVector<int64_t> staticPos;
+  SmallVector<Value> dynamicPos;
+  dispatchIndexOpFoldResults(position, dynamicPos, staticPos);
+  build(builder, state, source, dest, dynamicPos, staticPos);
 }
 
 #define GET_ATTRDEF_CLASSES

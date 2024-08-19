@@ -463,7 +463,7 @@ static func::FuncOp getOrInsertFuncDecl(ConversionPatternRewriter &rewriter,
   func::FuncOp fnOp;
   // if the function is already declared, use the existing function, don't
   // declare multiple times
-  if (fnOpLookup != NULL) {
+  if (fnOpLookup != nullptr) {
     fnOp = fnOpLookup;
   } else {
     StringAttr t1 = rewriter.getStringAttr("sym_visibility");

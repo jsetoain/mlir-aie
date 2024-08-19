@@ -96,17 +96,16 @@ def AIEVec_FMAElemOp :
   }];
 }
 
-
 def AIEVec_MulElemOp:
-  AIEVec_Op<"mul_elem", [	 
+  AIEVec_Op<"mul_elem", [
     Pure,
     SameTypeOperands,
     SameOperandsShape,
     SameOperandsAndResultShape,
     isOperandResultTypePairValidForAIE2MulElem<"lhs", "rhs", "result">
-  ]>,	  
+  ]>,
   Arguments<(ins
-    VectorOfLengthAndType<[16, 32], [I8, I16, I32, BF16, F32]>:$lhs, 
+    VectorOfLengthAndType<[16, 32], [I8, I16, I32, BF16, F32]>:$lhs,
     VectorOfLengthAndType<[16, 32], [I8, I16, I32, BF16, F32]>:$rhs)>,
   Results<(outs
     VectorOfLengthAndType<[16, 32], [I32, I64, F32]>:$result)> {
@@ -124,7 +123,7 @@ def AIEVec_MulElemOp:
         `vector<16xbf16>`  | `vector<16xbf16>`  | `vector<16xf32>`
         `vector<16xf32>`   | `vector<16xf32>`   | `vector<16xf32>`'
   }];
-} 
+}
 
 def AIEVec_BroadcastOp:
   AIEVec_Op<"broadcast", [
@@ -186,7 +185,7 @@ def AIEVec_UPSOp:
 def AIEVec_CastOp:
   AIEVec_Op<"cast", [
     Pure
-  ]>, 
+  ]>,
   Arguments<(ins AnyVector:$source, DefaultValuedAttr<BoolAttr, "false">:$isResAcc)>,
   Results<(outs AnyVector:$result)> {
   let summary = "AIE cast";
@@ -227,21 +226,21 @@ def AIEVec_UPDOp:
                  DefaultValuedAttr<AIEI32Attr, "0">:$offset,
                  DefaultValuedAttr<ConfinedAttr<AIEI8Attr,
                         [IntMinValue<0>, IntMaxValue<1>]>, "0">:$index,
-                 Optional<AnyVector>:$vector)>, 
+                 Optional<AnyVector>:$vector)>,
   Results<(outs AnyVector:$result)> {
   let summary = "AIE upd";
   let description = [{
     AMD-specific update intrinsic. General upd intrinsic updates contiguous
-    lanes of the result vector from a smaller source vector. This form of 
-    upd intrinsic combines the load of data from memory into a vector 
-    register, and then updating the lanes of the result vector using it. 
+    lanes of the result vector from a smaller source vector. This form of
+    upd intrinsic combines the load of data from memory into a vector
+    register, and then updating the lanes of the result vector using it.
     `$result = upd($source[$indices], $offset, $index)`
   }];
   let builders = [
     OpBuilder<(ins "mlir::Type":$resultType, "mlir::Value":$source,
                    "mlir::ValueRange":$indices,
                    "int32_t":$offset, "int8_t":$index),
-    [{build($_builder, $_state, resultType, source, indices, 
+    [{build($_builder, $_state, resultType, source, indices,
                    offset, index, nullptr);}]>
   ];
 }
@@ -249,8 +248,8 @@ def AIEVec_UPDOp:
 def AIEVec_ConcatOp:
   AIEVec_Op<"concat", [
     Pure, InferTypeOpAdaptor,
-  ]>, 
-  Arguments<(ins Variadic<AnyVector>:$sources)>, 
+  ]>,
+  Arguments<(ins Variadic<AnyVector>:$sources)>,
   Results<(outs AnyVector:$result)> {
   let summary = "AIE concat";
   let description = [{
@@ -270,8 +269,8 @@ def AIEVec_ExtOp:
   Results<(outs AnyVector:$result)> {
   let summary = "AIE ext";
   let description = [{
-    AMD-specific vector extract intrinsic. Selects contiguous lanes from 
-    the source vector, and transfers the data from those lanes to the 
+    AMD-specific vector extract intrinsic. Selects contiguous lanes from
+    the source vector, and transfers the data from those lanes to the
     result. The lane selection is controlled by index. There are two cases:
     1. Extracted vector fills half of the original vector lanes (e.g. extract v64int8 from v128int8)
     2. Extracted vector fills a fourth of the original vector lanes (e.g. extract v32int8 from v128int8)
@@ -281,10 +280,116 @@ def AIEVec_ExtOp:
   }];
 }
 
+def AIEVec_ExtractOp:
+  AIEVec_Op<"extract", [
+    Pure,
+    AllElementTypesMatch<["source", "result"]>
+  ]>,
+  Arguments<(ins AIE2VectorType:$source,
+                 Variadic<Index>:$dynamic_position,
+                 DenseI64ArrayAttr:$static_position)>,
+  Results<(outs AnyType:$result)> {
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$source, "int64_t":$position)>,
+    OpBuilder<(ins "mlir::Value":$source, "mlir::OpFoldResult":$position)>
+  ];
+
+  let extraClassDeclaration = [{
+    mlir::VectorType getSourceVectorType() {
+      return ::llvm::cast<mlir::VectorType>(getSource().getType());
+    }
+
+    /// Return a vector with all the static and dynamic position indices.
+    mlir::SmallVector<mlir::OpFoldResult> getMixedPosition() {
+      mlir::OpBuilder builder(getContext());
+      return getMixedValues(getStaticPosition(), getDynamicPosition(), builder);
+    }
+
+    unsigned getNumIndices() {
+      return getStaticPosition().size();
+    }
+
+    bool hasDynamicPosition() {
+      return llvm::any_of(getDynamicPosition(),
+                          [](mlir::Value operand) {
+                            return operand != nullptr; });
+    }
+
+    int64_t getPosition();
+  }];
+
+  let summary = "AIE2 extract element or sub-vector from vector";
+  let description = [{
+    AMD-specific vector extract operation. Extract an element or sub-vector
+    from the source vector, starting from the specified position.
+  }];
+  let assemblyFormat = [{
+    $source custom<DynamicIndexList>($dynamic_position, $static_position)
+    attr-dict `:` type($result) `from` type($source) }];
+  let hasVerifier = 1;
+}
+
+def AIEVec_InsertOp:
+  AIEVec_Op<"insert", [
+    Pure,
+    AllElementTypesMatch<["source", "dest"]>,
+    AllTypesMatch<["dest", "result"]>
+  ]>,
+  Arguments<(ins AnyType:$source,
+                 AIE2VectorType:$dest,
+                 Variadic<Index>:$dynamic_position,
+                 DenseI64ArrayAttr:$static_position)>,
+  Results<(outs AnyVector:$result)> {
+
+  let builders = [
+    OpBuilder<(ins "mlir::Value":$source, "mlir::Value":$dest,
+                   "int64_t":$position)>,
+    OpBuilder<(ins "mlir::Value":$source, "mlir::Value":$dest,
+                   "mlir::OpFoldResult":$position)>
+  ];
+
+  let extraClassDeclaration = [{
+    mlir::Type getSourceType() { return getSource().getType(); }
+    mlir::VectorType getDestVectorType() {
+      return ::llvm::cast<mlir::VectorType>(getDest().getType());
+    }
+
+    /// Return a vector with all the static and dynamic position indices.
+    mlir::SmallVector<mlir::OpFoldResult> getMixedPosition() {
+      mlir::OpBuilder builder(getContext());
+      return getMixedValues(getStaticPosition(), getDynamicPosition(), builder);
+    }
+
+    unsigned getNumIndices() {
+      return getStaticPosition().size();
+    }
+
+    bool hasDynamicPosition() {
+      return llvm::any_of(getDynamicPosition(),
+                          [](mlir::Value operand) {
+                            return operand != nullptr; });
+    }
+
+    int64_t getPosition();
+  }];
+
+  let summary = "AIE2 insert element or sub-vector in vector";
+  let description = [{
+    AMD-specific vector insert operation. Inserts the source value in the
+    destination vector starting from the specified position. The source can be
+    either an elemental type, or a vector that can fit within the destination
+    starting from the given position.
+  }];
+  let assemblyFormat = [{
+    $source `,` $dest custom<DynamicIndexList>($dynamic_position,
+    $static_position) attr-dict `:` type($source) `into` type($dest) }];
+  let hasVerifier = 1;
+}
+
 def AIEVec_PackOp:
   AIEVec_Op<"pack", [
     Pure
-  ]>, 
+  ]>,
   Arguments<(ins AnyVector:$source)>,
   Results<(outs AnyVector:$result)> {
   let summary = "AIE pack";
@@ -298,7 +403,7 @@ def AIEVec_PackOp:
 def AIEVec_UnpackOp:
   AIEVec_Op<"unpack", [
     Pure
-  ]>, 
+  ]>,
   Arguments<(ins AnyVector:$source)>,
   Results<(outs AnyVector:$result)> {
   let summary = "AIE unpack";
@@ -319,8 +424,8 @@ def AIEVec_ShiftOp:
   let description = [{
     AMD-specific shift intrinsic. Concatenates two
     vectors into a bigger vector, interprets them as a vector of 128 bytes
-    and returns v1::v2[shift: shift+64]. `shift` is the number of bytes to 
-    be shifted. The verifier confirms that all the input and result vectors 
+    and returns v1::v2[shift: shift+64]. `shift` is the number of bytes to
+    be shifted. The verifier confirms that all the input and result vectors
     have the same number of lanes and element types.
     `$result = shift($lhs, $rhs, $shift)`
   }];

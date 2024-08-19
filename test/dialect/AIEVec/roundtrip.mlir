@@ -361,3 +361,34 @@ func.func @shuffle_i512(%v : vector<1xi512>) -> vector<1xi512> {
   %1 = aievec.shuffle %0, %v [t512_1x2_hi] : vector<1xi512>
   return %1 : vector<1xi512>
 }
+
+// -----
+
+func.func @insert_scalar(%src : i32, %dst : vector<16xi32>, %idx : index)
+            -> vector<16xi32> {
+  // CHECK: %[[C5:.*]] = arith.constant 5 : index
+  %c5 = arith.constant 5 : index
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [6] : i32 into vector<16xi32>
+  %0 = aievec.insert %src, %dst [6] : i32 into vector<16xi32>
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [%{{.*}}] : i32 into vector<16xi32>
+  %1 = aievec.insert %src, %0 [%idx] : i32 into vector<16xi32>
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [%[[C5]]] : i32 into vector<16xi32>
+  %2 = aievec.insert %src, %1 [%c5] : i32 into vector<16xi32>
+  return %2 : vector<16xi32>
+}
+
+// -----
+
+func.func @insert_vector(%src : vector<4xi32>, %dst : vector<16xi32>,
+                         %idx : index) -> vector<16xi32> {
+  // CHECK: %[[C4:.*]] = arith.constant 4 : index
+  %c5 = arith.constant 4 : index
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [8] : vector<4xi32> into vector<16xi32>
+  %0 = aievec.insert %src, %dst [8] : vector<4xi32> into vector<16xi32>
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [%{{.*}}] : vector<4xi32> into vector<16xi32>
+  %1 = aievec.insert %src, %0 [%idx] : vector<4xi32> into vector<16xi32>
+  // CHECK: aievec.insert %{{.*}}, %{{.*}} [%[[C5]]] : vector<4xi32> into vector<16xi32>
+  %2 = aievec.insert %src, %1 [%c4] : vector<4xi32> into vector<16xi32>
+  return %2 : vector<16xi32>
+}
+
